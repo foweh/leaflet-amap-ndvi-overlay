@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Leaflet + 高德卫星 + NDVI 叠加</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body { margin: 0; height: 100%; font: 14px/1.6 system-ui,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+    #map { position: absolute; inset: 0; }
+    .panel {
+      position: absolute; top: 12px; left: 50px; z-index: 1000;
+      background: rgba(15,26,20,.88); color: #e7f0e9; border: 1px solid #28402f;
+      border-radius: 12px; padding: 12px 14px; backdrop-filter: blur(6px); max-width: 300px;
+    }
+    .panel h1 { font-size: 15px; margin: 0 0 6px; }
+    .panel p { color: #8fa89a; margin: 0 0 10px; font-size: 12px; }
+    button { cursor: pointer; border: 1px solid #28402f; background: #1d3327; color: #e7f0e9; padding: 7px 12px; border-radius: 8px; font-size: 13px; }
+    button.on { background: #22c55e; color: #06210f; border-color: #22c55e; font-weight: 600; }
+    .tag { display:inline-block; margin-top:8px; font-size:12px; color:#9be29b; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <h1>高德卫星 + NDVI 叠加</h1>
+    <p>NDVI 是 WGS84，高德是 GCJ02。不转换直接叠，会偏几百米。</p>
+    <button id="toggle"></button>
+    <div class="tag" id="tag"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="coord.js"></script>
+  <script>
+    const map = L.map('map', { zoomControl: true }).setView([43.95, 126.48], 15);
+
+    // 高德卫星瓦片（GCJ02）
+    L.tileLayer('https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}', {
+      subdomains: ['1', '2', '3', '4'], maxZoom: 19, attribution: '© 高德地图'
+    }).addTo(map);
+
+    // NDVI 的 WGS84 bbox（minLng,minLat,maxLng,maxLat）
+    const ndviBbox = { minLng: 126.46, minLat: 43.93, maxLng: 126.50, maxLat: 43.97 };
+
+    // 造一张“假 NDVI”当叠加图（省得依赖二进制文件），真实场景直接用后端出的 ndvi.png
+    function makeNdviImage(size) {
+      const c = document.createElement('canvas');
+      c.width = c.height = size;
+      const ctx = c.getContext('2d');
+      const ramp = ctx.createLinearGradient(0, 0, size, size);
+      ramp.addColorStop(0, '#f97316');   // 弱
+      ramp.addColorStop(0.5, '#facc15');
+      ramp.addColorStop(1, '#15803d');   // 旺
+      ctx.fillStyle = ramp;
+      ctx.fillRect(0, 0, size, size);
+      // 撒几片“长势不均”的斑块
+      let s = 42;
+      const rnd = () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+      for (let i = 0; i < 14; i++) {
+        ctx.beginPath();
+        ctx.arc(rnd() * size, rnd() * size, size * (0.05 + rnd() * 0.12), 0, Math.PI * 2);
+        ctx.fillStyle = rnd() > 0.5 ? 'rgba(21,128,61,.55)' : 'rgba(249,115,22,.45)';
+        ctx.fill();
+      }
+      return c.toDataURL('image/png');
+    }
+    const ndviImg = makeNdviImage(512);
+
+    let aligned = true;
+    let overlay = null;
+    let marker = null;
+
+    function render() {
+      if (overlay) map.removeLayer(overlay);
+      if (marker) map.removeLayer(marker);
+
+      const bounds = aligned
+        ? Coord.wgs84BoundsToGcj02Leaflet(ndviBbox)
+        : Coord.wgs84BoundsToLeaflet(ndviBbox);
+
+      overlay = L.imageOverlay(ndviImg, bounds, { opacity: 0.72 }).addTo(map);
+
+      // bbox 中心：转换前后各放一个对照点
+      const c = Coord.wgs84ToGcj02((ndviBbox.minLng + ndviBbox.maxLng) / 2, (ndviBbox.minLat + ndviBbox.maxLat) / 2);
+      marker = L.circleMarker([c[1], c[0]], { radius: 4, color: '#fff', weight: 2, fillColor: '#111', fillOpacity: 1 })
+        .bindTooltip('bbox 中心 (GCJ02 下应该落在这)').addTo(map);
+
+      const dist = Coord.wgs84ToGcj02(ndviBbox.minLng, ndviBbox.minLat);
+      const dx = ((dist[0] - ndviBbox.minLng) * 111000 * Math.cos(ndviBbox.minLat * Math.PI / 180));
+      const dy = ((dist[1] - ndviBbox.minLat) * 111000);
+      const off = Math.round(Math.hypot(dx, dy));
+
+      document.getElementById('tag').textContent = aligned
+        ? '已对齐：bbox 转成 GCJ02（约偏 ' + off + 'm）'
+        : '不对齐：bbox 按原始 WGS84 叠 → 肉眼可见偏移';
+      const btn = document.getElementById('toggle');
+      btn.textContent = aligned ? '⇄ 切到「不对齐」看偏移' : '⇄ 切到「对齐(转GCJ02)」';
+      btn.className = aligned ? 'on' : '';
+    }
+
+    document.getElementById('toggle').addEventListener('click', function () {
+      aligned = !aligned;
+      render();
+    });
+    render();
+  </script>
+</body>
+</html>
